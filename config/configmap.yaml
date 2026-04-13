@@ -1,0 +1,68 @@
+# ============================================================
+# EXTERNAL CONFIGURATION STORE PATTERN
+# ============================================================
+# Este ConfigMap implementa el patrón External Configuration Store,
+# centralizando toda la configuración de la aplicación fuera del
+# código y de las imágenes Docker. Los microservicios leen sus
+# valores en tiempo de arranque mediante variables de entorno.
+#
+# ============================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: microservices-config
+  namespace: microservices-demo
+  labels:
+    app: microservices-demo
+    pattern: external-configuration-store
+    version: "1.0"
+  annotations:
+    description: "Configuración centralizada para todos los microservicios"
+    managed-by: "GitOps / Helm"
+
+data:
+  # ── Kafka settings ──────────────────────────────────────
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  KAFKA_TOPIC_VOTES: "votes"
+  KAFKA_CONSUMER_GROUP: "vote-consumer-group"
+  KAFKA_AUTO_OFFSET_RESET: "earliest"
+
+  # ── PostgreSQL settings ─────────────────────────────────
+  POSTGRES_HOST: "postgresql"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "votes"
+  POSTGRES_USER: "okteto"
+  # POSTGRES_PASSWORD viene de Secret (ver abajo)
+
+  # ── Vote service settings ───────────────────────────────
+  VOTE_SERVER_PORT: "8080"
+  VOTE_APP_NAME: "vote-service"
+  VOTE_LOG_LEVEL: "INFO"
+
+  # ── Result service settings ─────────────────────────────
+  RESULT_PORT: "4000"
+  RESULT_DATABASE_URL: "postgres://okteto:$(POSTGRES_PASSWORD)@postgresql/votes"
+  RESULT_LOG_LEVEL: "info"
+
+  # ── Worker settings ─────────────────────────────────────
+  WORKER_MAX_RETRIES: "5"
+  WORKER_RETRY_DELAY_MS: "1000"
+  WORKER_LOG_LEVEL: "info"
+
+---
+# ============================================================
+# Secret para valores sensibles
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: microservices-secrets
+  namespace: microservices-demo
+  labels:
+    app: microservices-demo
+    pattern: external-configuration-store
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "okteto"
+  DATABASE_URL: "postgres://okteto:okteto@postgresql/votes"
