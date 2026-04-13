@@ -257,61 +257,126 @@ bash scripts/smoke-test.sh all http://mi-app.staging.okteto.net
 # - Espera con timeout configurable hasta que el servicio esté listo
 
 ```
-# 6. Pipeline de Infraestructura
+# 6. Pipeline de Infraestructura  
+**Archivo:** `.github/workflows/infrastructure-pipeline.yml`
 
-## Validación
+## 6.1 Validación de Helm Charts  
+El primer job valida todos los Helm charts del proyecto:
 
 ```bash
-helm lint
-helm template
+helm lint infrastructure/
+helm lint vote/chart/
+helm lint result/chart/
+helm lint worker/chart/
+helm template vote vote/chart/ --values vote/chart/values.yaml > /dev/null
+````
+
+Si cualquier chart falla la validación, el pipeline se detiene inmediatamente.
+
+---
+
+## 6.2 Escaneo de Seguridad en Manifiestos
+
+Se renderizan los templates de Helm y se escanean con Checkov:
+
+```bash
+helm template infrastructure infrastructure/ > rendered/infrastructure.yaml
+checkov -d rendered/ --framework kubernetes --soft-fail
 ```
 
-## Seguridad
+Checkov verifica buenas prácticas de seguridad en Kubernetes: usuarios no-root, límites de recursos, read-only filesystem, etc.
+
+---
+
+## 6.3 Despliegue de Infraestructura (Staging y Producción)
+
+El despliegue de Kafka y PostgreSQL se hace vía Helm con la bandera `--atomic`, que hace rollback automático si el despliegue falla:
 
 ```bash
-checkov -d rendered/
-```
-
-## Deploy
-
-```bash
-helm upgrade --install --atomic
-```
-
-## Rollback
-
-```bash
-gh workflow run infrastructure-pipeline.yml
+helm upgrade --install infrastructure infrastructure/ \
+  --namespace $NAMESPACE \
+  --wait \
+  --timeout 5m \
+  --atomic   # rollback automático si falla
 ```
 
 ---
 
-# 7. Infraestructura
+## 6.4 Rollback Manual
 
-## Estructura
+El pipeline permite ejecutar un rollback manual mediante `workflow_dispatch`:
 
+```bash
+# Desde la UI de GitHub Actions o con gh CLI:
+gh workflow run infrastructure-pipeline.yml \
+  -f environment=staging \
+  -f action=rollback
 ```
+
+Esto ejecuta `scripts/rollback.sh` que usa `helm rollback` para volver a la versión anterior de cada release.
+
+---
+
+# 7. Implementación de la Infraestructura  
+
+## 7.1 Estructura de Helm Charts  
+El proyecto usa Helm como gestor de paquetes de Kubernetes. Cada microservicio tiene su propio chart en su directorio:
+
+```plaintext
 microservices-demo/
-  infrastructure/
-  vote/chart/
-  result/chart/
-  worker/chart/
-  config/configmap.yaml
-```
+  infrastructure/     # Chart de Kafka + PostgreSQL
+  vote/chart/         # Chart del servicio Java
+  result/chart/       # Chart del servicio Node.js
+  worker/chart/       # Chart del servicio Go
+  config/
+    configmap.yaml    # External Configuration Store (K8s ConfigMap)
+````
 
-## ConfigMap en deployment
+---
+
+## 7.2 ConfigMap de Kubernetes (External Configuration Store)
+
+El archivo `config/configmap.yaml` centraliza toda la configuración de la aplicación. Los deployments de Kubernetes referencian este ConfigMap para inyectar variables de entorno en los pods:
 
 ```yaml
+# En el deployment de worker (worker/chart/templates/deployment.yaml):
 envFrom:
   - configMapRef:
       name: microservices-config
+  - secretRef:
+      name: microservices-secrets
 ```
 
-## Despliegue
+---
+
+## 7.3 Despliegue con Okteto
+
+Para el despliegue en Okteto, se usa el archivo `okteto.yml` que orquesta la construcción de imágenes y el despliegue de los charts:
 
 ```bash
-okteto deploy
+$ git clone https://github.com/okteto/microservices-demo
+$ cd microservices-demo
+$ kubectl apply -f config/configmap.yaml  # Aplicar External Config Store
+$ okteto login
+$ okteto deploy
 ```
+
+---
+
+## 7.4 Secrets en CI/CD
+
+Las credenciales sensibles se gestionan como GitHub Secrets y nunca aparecen en el código:
+
+| Secret                   | Scope       | Uso                                      |
+| ------------------------ | ----------- | ---------------------------------------- |
+| DOCKER_USERNAME          | Repo        | Login a Docker Hub para push de imágenes |
+| DOCKER_PASSWORD          | Repo        | Login a Docker Hub                       |
+| OKTETO_TOKEN             | Env         | Autenticación con plataforma Okteto      |
+| OKTETO_URL               | Env         | URL de la instancia Okteto               |
+| OKTETO_NAMESPACE_STAGING | Env:staging | Namespace de staging en K8s              |
+| OKTETO_NAMESPACE_PROD    | Env:prod    | Namespace de producción en K8s           |
+
+
 
 ---
 
