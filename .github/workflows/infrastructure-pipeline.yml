@@ -1,0 +1,206 @@
+name: Infrastructure Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'ops/**'
+    paths:
+      - 'infrastructure/**'
+      - 'vote/chart/**'
+      - 'result/chart/**'
+      - 'worker/chart/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - rollback
+          - destroy
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Validate Helm Charts
+  # ─────────────────────────────────────────────
+  validate-helm:
+    name: Validate Helm Charts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+
+      - name: Helm lint - infrastructure
+        run: helm lint infrastructure/
+
+      - name: Helm lint - vote
+        run: helm lint vote/chart/
+
+      - name: Helm lint - result
+        run: helm lint result/chart/
+
+      - name: Helm lint - worker
+        run: helm lint worker/chart/
+
+      - name: Helm template validation
+        run: |
+          helm template vote vote/chart/ --values vote/chart/values.yaml > /dev/null
+          helm template result result/chart/ --values result/chart/values.yaml > /dev/null
+          helm template worker worker/chart/ --values worker/chart/values.yaml > /dev/null
+          echo "✅ All Helm templates are valid"
+
+      - name: Install helm-docs
+        run: |
+          wget https://github.com/norwoodj/helm-docs/releases/download/v1.13.1/helm-docs_1.13.1_Linux_x86_64.tar.gz
+          tar -xzf helm-docs_1.13.1_Linux_x86_64.tar.gz
+          sudo mv helm-docs /usr/local/bin/
+          helm-docs --version
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Security Scan on K8s Manifests
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Security Scan (Kubesec + Checkov)
+    runs-on: ubuntu-latest
+    needs: validate-helm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Render Helm templates
+        run: |
+          mkdir -p rendered
+          helm template infrastructure infrastructure/ > rendered/infrastructure.yaml
+          helm template vote vote/chart/ > rendered/vote.yaml
+          helm template result result/chart/ > rendered/result.yaml
+          helm template worker worker/chart/ > rendered/worker.yaml
+
+      - name: Run Checkov on rendered manifests
+        run: |
+          pip install checkov
+          checkov -d rendered/ --framework kubernetes \
+            --skip-check CKV_K8S_14,CKV_K8S_43 \
+            --soft-fail || true
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Deploy Infrastructure (Staging)
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy Infrastructure - Staging
+    runs-on: ubuntu-latest
+    needs: [validate-helm, security-scan]
+    if: |
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/ops/')) &&
+      (github.event.inputs.environment == 'staging' || github.event.inputs.environment == '')
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Okteto CLI
+        run: curl https://get.okteto.com -sSfL | sh
+
+      - name: Configure Okteto context
+        run: |
+          okteto context use ${{ secrets.OKTETO_URL }} \
+            --token ${{ secrets.OKTETO_TOKEN }} \
+            --namespace ${{ secrets.OKTETO_NAMESPACE_STAGING }}
+
+      - name: Deploy infrastructure (Kafka + PostgreSQL)
+        run: |
+          helm upgrade --install infrastructure infrastructure/ \
+            --namespace ${{ secrets.OKTETO_NAMESPACE_STAGING }} \
+            --wait \
+            --timeout 5m \
+            --atomic
+        env:
+          KUBECONFIG: ${{ steps.kubeconfig.outputs.path }}
+
+      - name: Verify infrastructure health
+        run: bash scripts/verify-infra.sh staging
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Infrastructure deployed to staging successfully"
+          echo "Commit: ${{ github.sha }}"
+          echo "Triggered by: ${{ github.actor }}"
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Deploy to Production (con aprobación manual)
+  # ─────────────────────────────────────────────
+  deploy-production:
+    name: Deploy Infrastructure - Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: ${{ secrets.PROD_APP_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Okteto CLI
+        run: curl https://get.okteto.com -sSfL | sh
+
+      - name: Configure Okteto context (Production)
+        run: |
+          okteto context use ${{ secrets.OKTETO_URL }} \
+            --token ${{ secrets.OKTETO_TOKEN }} \
+            --namespace ${{ secrets.OKTETO_NAMESPACE_PROD }}
+
+      - name: Deploy all services to production
+        run: |
+          okteto deploy --wait
+        env:
+          OKTETO_BUILD_VOTE_IMAGE: ${{ secrets.DOCKER_USERNAME }}/microservices-demo-vote:${{ github.sha }}
+          OKTETO_BUILD_RESULT_IMAGE: ${{ secrets.DOCKER_USERNAME }}/microservices-demo-result:${{ github.sha }}
+          OKTETO_BUILD_WORKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/microservices-demo-worker:${{ github.sha }}
+
+      - name: Run production smoke tests
+        run: bash scripts/smoke-test.sh all ${{ secrets.PROD_APP_URL }}
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Rollback (manual trigger only)
+  # ─────────────────────────────────────────────
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'rollback'
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Execute rollback script
+        run: bash scripts/rollback.sh ${{ github.event.inputs.environment }}
+        env:
+          OKTETO_TOKEN: ${{ secrets.OKTETO_TOKEN }}
+          OKTETO_URL: ${{ secrets.OKTETO_URL }}
